@@ -1,4 +1,4 @@
-#pragma GCC optimize("O2") // code optimisation controls - "O2" & "O3" code performance, "Os" code size
+// #pragma GCC optimize("Os") // code optimisation controls - "O2" & "O3" code performance, "Os" code size
 #include <Arduino.h>
 #include <Wire.h>
 #include "I2C_LCD.h"
@@ -8,6 +8,8 @@
 #include <Blinkenlight.h>
 #include <EEPROM.h>
 #include "EMAFilter.h"
+#include <Adafruit_NeoPixel.h>
+#define test_mode 0 // Set to 1 to enable test mode, 0 for normal operation
 //  ==================== LCD & DISPLAY SETTINGS ====================
 #define LCD_SPACE_SYMBOL 0x20 // Space symbol from LCD ROM (GDM2004D datasheet p.9)
 #define LCD_COLS 20
@@ -25,14 +27,19 @@
 #define D6_pin 6
 #define D7_pin 7
 
+// ==================== LED DEFINITIONS ====================
+constexpr uint8_t LED_PIN = 11;
+#define NUM_LEDS 1
+
+Adafruit_NeoPixel strip(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
+
 // ==================== HARDWARE PIN DEFINITIONS ====================
 constexpr uint8_t PIN_BTN = 4;
 constexpr uint8_t CLK = 5;          // TM1637 CLK
 constexpr uint8_t DIO = 6;          // TM1637 DIO
 constexpr uint8_t ONE_WIRE_BUS = 7; // Temperature sensor data wire
 constexpr uint8_t BUZZER_PIN = 10;
-constexpr uint8_t SSR = 13;
-constexpr uint8_t SSR_LED = 11;
+constexpr uint8_t SSR = 9;
 
 // ==================== COMMUNICATION SETTINGS ====================
 constexpr uint16_t SERIAL_BAUDRATE = 9600;
@@ -43,9 +50,10 @@ float offset_temp = 0.0; // Calibration offset
 
 // Temperature control limits
 constexpr float MIN_SETPOINT = 10, MAX_SETPOINT = 99;
-float Setpoint = 60;
-float prev_temp = 0, temperature = 0.0;
-float delta = 0, pwm = 0, old_pwm = -1;
+float Setpoint = 45;
+float prev_temp = 0.0, temperature = 0.0;
+float calculated_power = 0.0;
+float delta = 0.0, old_delta = 0.0, pwm = 0.0, old_pwm = -1.0;
 
 // Sampling settings
 constexpr uint32_t SAMPLE_PERIOD = 500;
@@ -55,63 +63,42 @@ unsigned delayInMillis = 500; // Wait time for temp reading
 
 // ==================== PWM & CONTROL SETTINGS ====================
 float OVERSHOOT_X = -0.1;
-float NEAR_LIMIT = 0.3;
-float FAR_LIMIT = 3.0;
-float PWM_FAR = 80.0, PWM_NEAR = 5.0;
+float NEAR_LIMIT = 0.1;
+float FAR_LIMIT = 1.5;
+float PWM_FAR = 90.0, PWM_NEAR_OFFSET = 0.0, PWM_N = 0.0;
 uint32_t PWM_PERIOD = 5000;
 bool pwmstate = false;
 uint32_t onPWM_PERIOD = 0;
 
+float MAINT_A = 0.01455f; // Coefficient A for maintenance power
+float MAINT_B = 0.08593f; // Coefficient B for maintenance power
+float MAINT_C = 6.8386f;  // Coefficient C for maintenance power
+
 // ==================== MENU & UI SETTINGS ====================
-volatile uint8_t menu_select = 0;
-bool need_save = false;
-uint8_t buttonState;
+uint8_t menu_select = 0;
 uint8_t encbutton_state;
 unsigned long buttontick = 0;
-const char *menu1[] = {"MANUAL", "AUTO", "SETTINGS", "MEMORY", NULL};
+const char *menu1[] = {"BREW", "SETTINGS", "MEMORY", NULL};
 const char *menu2[] = {"LOAD", "SAVE", "DEFAULTS", "BACK", NULL};
 const char *menu3[] = {"START", "BACK", "EXIT", NULL};
-#define VERSION 1.0
-
-// ==================== AUTOMATION VARIABLES ====================
-volatile byte mash_rests = 2;
-volatile byte rest_stp[] = {10, 10, 10, 10, 10, 10, 10, 10, 10, 10};
-volatile byte rest_dur[] = {2, 2, 2, 5, 5, 5, 5, 5, 5, 5};
-volatile byte hops_nmbr = 2;
-volatile byte hop_time[] = {5, 5, 5, 5, 5};
 
 // ==================== TIMER VARIABLES ====================
 uint32_t chronostart = 0, timelapse = 0;
 uint8_t h = 0, m = 0, s = 0, old_s, old_m, old_h;
 uint32_t startime = 0;
 bool timer_active = false, querry_temp = false, error = false;
-bool pauseCountdown = false;  // Variable de pause
-unsigned long pausedTime = 0; // Temps restant lors de la pause
-// ==================== PRESET TEMPERATURE PROFILES ====================
-byte mash_mode = 4;
-byte preset = 1, preset_max = 10;
-const char *pre_name[] = {
-    "Min ", "Temp #1", "Temp #2", "Temp #3", "Temp #4",
-    "Temp #5", "Temp #6", "Temp #7", "Temp Out", "Boil"};
-float pre_setpt[] = {10, 40, 50, 62, 64, 65, 68, 72, 78, 97};
+unsigned long stabilityStartTime = 0;
+bool stabilityCheck = false;
+float last_temp_for_rate = 0.0;
+unsigned long last_rate_time = 0;
+float heat_rate = 0.0;
 
 // ==================== STATE VARIABLES ====================
 bool emafilter = true;
 bool click_prev = true;
-float push_time = 0;
-byte countdown_active = 0;
+float push_time = 0.0;
 bool fineajust = 0;
-
-// ==================== AUTO MODE STATE VARIABLES ====================
-bool automode_started = 0;
-int actual_step = -1;
-bool stepcomplete = 0;
-bool temp_reached = 0;
-bool chrono_started = 0;
-unsigned long step_time_started = 0;
-bool pause = 0;
-bool confirm = 0;
-byte actual_hop = 0;
+byte mash_mode = 3;
 
 // ==================== OBJECT INITIALIZATION ====================
 OneWire oneWire(ONE_WIRE_BUS);
@@ -124,6 +111,8 @@ Blinkenlight buzz(BUZZER_PIN);
 
 // ==================== FUNCTION PROTOTYPES ====================
 void buttonstate();
+void red();
+void black();
 
 // ==================== CUSTOM CHARACTERS ====================
 uint8_t delta_char[8] = {
@@ -149,11 +138,17 @@ void writeEEPROM()
   address += sizeof(FAR_LIMIT);
   EEPROM.put(address, PWM_FAR);
   address += sizeof(PWM_FAR);
-  EEPROM.put(address, PWM_NEAR);
-  address += sizeof(PWM_NEAR);
+  EEPROM.put(address, PWM_NEAR_OFFSET);
+  address += sizeof(PWM_NEAR_OFFSET);
   EEPROM.put(address, PWM_PERIOD);
   address += sizeof(PWM_PERIOD);
   EEPROM.put(address, emafilter);
+  address += sizeof(emafilter);
+  EEPROM.put(address, MAINT_A);
+  address += sizeof(MAINT_A);
+  EEPROM.put(address, MAINT_B);
+  address += sizeof(MAINT_B);
+  EEPROM.put(address, MAINT_C);
 }
 
 void readEEPROM()
@@ -169,11 +164,17 @@ void readEEPROM()
   address += sizeof(FAR_LIMIT);
   EEPROM.get(address, PWM_FAR);
   address += sizeof(PWM_FAR);
-  EEPROM.get(address, PWM_NEAR);
-  address += sizeof(PWM_NEAR);
+  EEPROM.get(address, PWM_NEAR_OFFSET);
+  address += sizeof(PWM_NEAR_OFFSET);
   EEPROM.get(address, PWM_PERIOD);
   address += sizeof(PWM_PERIOD);
   EEPROM.get(address, emafilter);
+  address += sizeof(emafilter);
+  EEPROM.get(address, MAINT_A);
+  address += sizeof(MAINT_A);
+  EEPROM.get(address, MAINT_B);
+  address += sizeof(MAINT_B);
+  EEPROM.get(address, MAINT_C);
 }
 
 // ==================== ENCODER MANAGEMENT ====================
@@ -207,6 +208,16 @@ void updateEncoder(int direction, unsigned long currentTime)
     accelFactor = 1;
   }
   encPos = direction * accelFactor;
+}
+
+void resetSensor()
+{
+  sensors.begin(); // Réinitialise le bus OneWire
+  if (sensors.getAddress(tempDeviceAddress, 0))
+  {
+    sensors.setResolution(tempDeviceAddress, TEMPERATURE_PRECISION);
+    sensors.setWaitForConversion(false);
+  }
 }
 
 void print_space(byte sp)
@@ -256,48 +267,83 @@ void PinB()
   }
 }
 
+float calc_maintain_pow(float stp)
+{
+  float result = MAINT_A * expf(MAINT_B * stp) + MAINT_C;
+  return roundf(result * 10) / 10.0;
+}
+
 void factory_rst()
 {
   lcd.clear();
   lcd.print(F("Factory Reset"));
   offset_temp = 0.0;
   OVERSHOOT_X = -0.1;
-  NEAR_LIMIT = 0.3;
-  FAR_LIMIT = 3;
-  PWM_FAR = 80;
-  PWM_NEAR = 5;
+  NEAR_LIMIT = 0.1;
+  FAR_LIMIT = 1.5;
+  PWM_FAR = 90;
+  PWM_NEAR_OFFSET = 0.0;
   PWM_PERIOD = 5000;
   emafilter = true;
+  MAINT_A = 0.01455f;
+  MAINT_B = 0.08593f;
+  MAINT_C = 6.8386f;
   delay(1000);
   lcd.print(F("OK!"));
 }
-
 void check_counter()
 {
-  if (abs(delta) < NEAR_LIMIT && timer_active == false)
-  {
-    timer_active = true;
-    chronostart = millis();
-    buzz.pattern(3, false);
-  }
+  static bool wasStable = false;
 
-  if (abs(delta) > NEAR_LIMIT && timer_active == true)
+  // Vérifie si l'écart entre température et consigne est trop grand
+  if (abs(temperature - Setpoint) > 2.0)
   {
     timer_active = false;
+    chronostart = 0;
+    h = m = s = 0;
     lcd.setCursor(0, 3);
     lcd.print(F("00:00:00"));
+    wasStable = false;
+    return;
+  }
+
+  // Vérifie la stabilité de la température
+  if (abs(delta) < NEAR_LIMIT)
+  {
+    if (!wasStable)
+    {
+      stabilityStartTime = millis();
+      wasStable = true;
+    }
+
+    // Démarre le timer après 20s de stabilité
+    if (!timer_active && wasStable && (millis() - stabilityStartTime >= 20000))
+    {
+      timer_active = true;
+      chronostart = millis();
+      buzz.pattern(3, false);
+    }
+  }
+  else
+  {
+    wasStable = false;
   }
 }
 
 void ssr_mgmt()
 {
+  if (error)
+  {
+    pwm = 0;
+    digitalWrite(SSR, LOW);
+    black();
+  }
   // Mise à jour de l'affichage PWM uniquement si changement
   if (old_pwm != pwm)
   {
     lcd.setCursor(5, 1);
     print_space(6);
     lcd.setCursor(5, 1);
-    // lcd.print(F("PWM: "));
     lcd.print(pwm, 1);
     lcd.print(F("%"));
     old_pwm = pwm;
@@ -314,7 +360,7 @@ void ssr_mgmt()
     if (pwm > 0)
     {
       digitalWrite(SSR, HIGH);
-      digitalWrite(SSR_LED, HIGH);
+      red();
 
       pwmstate = true;
     }
@@ -324,58 +370,50 @@ void ssr_mgmt()
   if (pwmstate && (currentMillis - startime >= onPWM_PERIOD))
   {
     digitalWrite(SSR, LOW);
-    digitalWrite(SSR_LED, LOW);
+    black();
 
     pwmstate = false;
   }
 }
 
+float pwm_cal()
+{
+  float ramp_temp = (delta - NEAR_LIMIT) * ((PWM_FAR - calculated_power) / (FAR_LIMIT - NEAR_LIMIT));
+  float ramp;
+  ramp = roundf(ramp_temp * 10) / 10.0;
+
+  float return_value;
+
+  return_value = (delta <= OVERSHOOT_X)  ? 0
+                 : (delta <= NEAR_LIMIT) ? PWM_N
+                 : (delta < FAR_LIMIT)   ? PWM_N + ramp
+                                         : PWM_NEAR_OFFSET + PWM_FAR;
+
+  return return_value;
+}
+
 // ==================== SETPOINT MANAGEMENT ====================
 void setpoint_mgmt()
 {
-  if (encPos != 0 && !automode_started)
+  if (encPos != 0)
   {
     Setpoint = constrain(Setpoint + (0.1 * encPos), MIN_SETPOINT, MAX_SETPOINT);
     encPos = 0;
 
     lcd.setCursor(5, 0);
-    // lcd.print(F("Set: "));
     lcd.print(Setpoint, 1);
     print_deg();
   }
 
   delta = Setpoint - temperature;
-  pwm = (delta <= OVERSHOOT_X)  ? 0
-        : (delta <= NEAR_LIMIT) ? PWM_NEAR
-        : (delta < FAR_LIMIT)   ? PWM_NEAR + (delta - NEAR_LIMIT) * ((PWM_FAR - PWM_NEAR) / (FAR_LIMIT - NEAR_LIMIT))
-                                : PWM_FAR;
-}
-
-void disp_preset()
-{
-  lcd.setCursor(0, 0);
-  print_space(16);
-  lcd.setCursor(0, 0);
-  lcd.print(pre_name[preset]);
-  lcd.write(ARROW_RIGHT);
-  lcd.print(pre_setpt[preset], 0);
-  Setpoint = pre_setpt[preset];
-  print_deg();
-  encPos = 0;
-}
-
-void preset_mgmt()
-{
-  if (encPos != 0)
+  if (old_delta != delta)
   {
-    int oldpreset = preset;
-    preset = constrain(preset + encPos, 0, preset_max - 1);
-    encPos = 0;
-    if (oldpreset != preset)
-    {
-      disp_preset();
-    }
+
+    PWM_N = PWM_NEAR_OFFSET + calculated_power;
   }
+  old_delta = delta;
+
+  pwm = pwm_cal();
 }
 
 void restore_disp_man()
@@ -403,8 +441,6 @@ void dis_mode()
     lcd.print(F("MASH  "));
     lcd.setCursor(0, 2);
     lcd.clearEOL();
-
-    // print_space(16);
   }
   else if (mash_mode == 2)
   {
@@ -415,18 +451,8 @@ void dis_mode()
     lcd.print(F("BOIL  "));
     lcd.setCursor(0, 2);
     lcd.clearEOL();
-
-    //  print_space(16);
   }
   else if (mash_mode == 3)
-  {
-    axcel = 0;
-    restore_disp_man();
-    lcd.setCursor(13, 1);
-    lcd.print(F("PRESET"));
-    disp_preset();
-  }
-  else if (mash_mode == 4)
   {
     axcel = 0;
     restore_disp_man();
@@ -497,52 +523,79 @@ void fine()
 
   if (encPos != 0)
   {
-    PWM_NEAR = constrain(PWM_NEAR + (0.1 * encPos), 0, PWM_FAR);
-    pwm = PWM_NEAR;
+    PWM_NEAR_OFFSET = constrain(PWM_NEAR_OFFSET + (0.1 * encPos), -30, 30);
+    PWM_N = PWM_NEAR_OFFSET + calculated_power;
+    pwm = pwm_cal();
+
+    if (pwm < 0)
+    {
+      pwm = 0;
+    }
+    if (pwm > 100)
+    {
+      pwm = 100;
+    }
     ssr_mgmt();
     encPos = 0;
+    lcd.setCursor(0, 2);
+    lcd.clearEOL();
+    lcd.setCursor(0, 2);
+    lcd.print(F("Offset: "));
+    lcd.print(PWM_NEAR_OFFSET, 1);
   }
 }
 
 void read_temp()
 {
-  // Check if it's time to request new temperature reading
   if (millis() - lastTempRequest >= delayInMillis)
   {
-    // First pass: request temperature reading
     if (!querry_temp)
     {
       sensors.requestTemperatures();
       lastTempRequest = millis();
       querry_temp = true;
     }
-    // Second pass: get the temperature value
     else
     {
-      if (emafilter)
+      float rawTemp = sensors.getTempCByIndex(0);
+
+      // Gestion erreur sonde
+      if (rawTemp == -127.00 || rawTemp == DEVICE_DISCONNECTED_C)
       {
-        float rawTemp = sensors.getTempCByIndex(0);
-        temperature = tempFilter.update(rawTemp);
+        if (!error)
+        { // Seulement à la première détection d'erreur
+          error = true;
+          pwm = 0;
+          static char err[] = "Err"; // Tableau de caractères modifiable
+          tm.displayPChar(err);
+        }
       }
       else
-        temperature = sensors.getTempCByIndex(0) + offset_temp;
+      { // Température valide
+        if (error)
+        { // Si on sort d'une erreur
+          error = false;
+          resetSensor(); // Réinitialise une fois que le capteur est reconnu
+          tm.displayFloat(temperature, 1);
+        }
 
-      if (temperature == -127.00)
-      {
-        error = true;
-        pwm = 0;
-      }
-      if (temperature != -127.00 && error)
-      {
-        error = false;
+        if (emafilter)
+          temperature = tempFilter.update(rawTemp);
+        else
+          temperature = rawTemp + offset_temp;
+
+        if (test_mode)
+          temperature = 50;
+
+        if (temperature != prev_temp)
+        {
+          tm.displayFloat(temperature, 1);
+          prev_temp = temperature;
+          delta = Setpoint - temperature;
+          calculated_power = calc_maintain_pow(temperature);
+        }
       }
       querry_temp = false;
-      if (temperature != prev_temp)
-      {
-        tm.displayFloat(temperature, 1);
-        prev_temp = temperature;
-        delta = Setpoint - temperature;
-      }
     }
   }
 }
@@ -555,18 +608,19 @@ void rot_man()
   {
     fineajust = 0;
     encbutton_state = 0;
-    lcd.setCursor(19, 3);
-    print_space(1);
+    lcd.setCursor(0, 2);
+    lcd.clearEOL();
   }
 
   if (encbutton_state == 1 && !fineajust)
   {
     // single click
     mash_mode++;
-    if (mash_mode > 4)
+    if (mash_mode > 3)
     {
       mash_mode = 1;
     }
+
     dis_mode();
     encbutton_state = 0;
   }
@@ -575,20 +629,24 @@ void rot_man()
   {
     // long press
     digitalWrite(SSR, LOW);
-    digitalWrite(SSR_LED, LOW);
+    black();
 
     pwmstate = false;
     menu_select = 0;
     encbutton_state = 0;
     fineajust = 0;
+    mash_mode = 3;
   }
   if (encbutton_state == 2 && mash_mode == 1)
   {
     if (!fineajust)
     {
-      lcd.setCursor(19, 3);
-      lcd.print(F("F"));
-      pwm = PWM_NEAR;
+      lcd.setCursor(0, 2);
+      lcd.print(F("Offset: "));
+      lcd.print(PWM_NEAR_OFFSET, 1);
+      pwm = pwm_cal();
+      lcd.setCursor(5, 1);
+      lcd.print(pwm, 1);
     }
     // keep pressed
     fineajust = 1;
@@ -752,31 +810,15 @@ byte menu_mode_flex(const char *menu[], const char *title)
   return 0;
 }
 
-void splash()
-{
-  lcd.clear();
-  lcd.home();
-  lcd.println(F("    FuZZy LoGic"));
-  lcd.println(F("  Temp. controller"));
-  lcd.println(F("   For BIAB RIMS"));
-  lcd.print(F("   Version "));
-  lcd.print(VERSION);
-  while (encbutton_state == 0)
-  {
-    buttonstate();
-  }
-  encbutton_state=0;
-}
-
 void setup(void)
 {
-  // Serial.begin(SERIAL_BAUDRATE);
+  Serial.begin(SERIAL_BAUDRATE);
   tm.begin(CLK, DIO, 4);
-  tm.setBrightness(5);
+  tm.setBrightness(3);
   tm.displayClear();
   lcd.config(39, En_pin, Rw_pin, Rs_pin, D4_pin, D5_pin, D6_pin, D7_pin, BACKLIGHT_PIN, POSITIVE);
   Wire.begin();
-  Wire.setClock(100000);
+  // Wire.setClock(100000);
   lcd.begin(20, 4);
   lcd.createChar(1, delta_char);
   lcd.createChar(2, arrowUp);
@@ -788,14 +830,17 @@ void setup(void)
   sensors.setWaitForConversion(false);
   pinMode(PIN_BTN, INPUT_PULLUP);
   pinMode(SSR, OUTPUT);
-
+  pinMode(LED_PIN, OUTPUT);
   pinMode(pinA, INPUT_PULLUP);      // set pinA as an input, pulled HIGH to the logic voltage (5V or 3.3V for most cases)
   pinMode(pinB, INPUT_PULLUP);      // set pinB as an input, pulled HIGH to the logic voltage (5V or 3.3V for most cases)
   attachInterrupt(0, PinA, RISING); // set an interrupt on PinA, looking for a rising edge signal and executing the "PinA" Interrupt Service Routine (below)
   attachInterrupt(1, PinB, RISING); // set an interrupt on PinB, looking for a rising edge signal and executing the "PinB" Interrupt Service Routine (below)
-  splash();
-    // readEEPROM();
-
+  strip.begin();
+  strip.show();
+  strip.setPixelColor(0, strip.Color(0, 0, 0));
+  strip.show();
+  black();
+  readEEPROM();
 }
 
 void manual_mode()
@@ -822,11 +867,6 @@ void manual_mode()
     boil_mgmt();
   }
   else if (mash_mode == 3)
-  {
-    preset_mgmt();
-    setpoint_mgmt();
-  }
-  else if (mash_mode == 4)
   {
     pwm = 0;
     boil_mgmt();
@@ -891,7 +931,7 @@ float selector(float variable, float min, float max, float inc, const byte decim
   return variable;
 }
 
-// ==================== SETTINGS AUTO MODE MENU ====================
+// ==================== SETTINGS MENU ====================
 void set_m()
 {
   lcd.blink();
@@ -924,11 +964,11 @@ void set_m()
   lcd.print("if " + String(OVERSHOOT_X) + "<\x01<");
   lcd.print(NEAR_LIMIT, 1);
   lcd.setCursor(0, 3);
-  lcd.print(F("PWM="));
-  lcd.print(PWM_NEAR, 1);
+  lcd.print(F("PWM offset="));
+  lcd.print(PWM_NEAR_OFFSET, 1);
   NEAR_LIMIT = selector(NEAR_LIMIT, OVERSHOOT_X, 6, 0.1, 1, 11, 2);
   delay(300);
-  PWM_NEAR = selector(PWM_NEAR, 0, 50, 0.1, 1, 4, 3);
+  PWM_NEAR_OFFSET = selector(PWM_NEAR_OFFSET, -30, 30, 0.1, 1, 11, 3);
 
   lcd.clear();
   lcd.setCursor(0, 0);
@@ -953,334 +993,53 @@ void set_m()
   lcd.print(FAR_LIMIT, 1);
   lcd.setCursor(0, 3);
   lcd.print(F("PMW="));
-  PWM_FAR = selector(PWM_FAR, PWM_NEAR, 100, 1, 0, 4, 3);
+  PWM_FAR = selector(PWM_FAR, 0, 100, 1, 0, 4, 3);
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(F("Power Curve Setup"));
+
+  // Coefficient A avec plus de précision et validation
+  float newA = modify("Coeff. A (x0.0001)", MAINT_A * 10000, 1, 10000, 1, "", 0);
+  MAINT_A = newA / 10000.0;
+
+  // Coefficient B avec plus de précision et validation
+  float newB = modify("Coeff. B (x0.0001)", MAINT_B * 10000, 1, 10000, 1, "", 0);
+  MAINT_B = newB / 10000.0;
+
+  // Coefficient C avec validation
+  MAINT_C = modify("Offset C", MAINT_C, 0.1, 20.0, 0.1, "", 1);
+
+  // Test de validité et correction si nécessaire
+  if (MAINT_A <= 0 || isnan(MAINT_A))
+    MAINT_A = 0.01455;
+  if (MAINT_B <= 0 || isnan(MAINT_B))
+    MAINT_B = 0.08593;
+  if (MAINT_C <= 0 || isnan(MAINT_C))
+    MAINT_C = 6.8386;
+
+  // Affichage des valeurs finales pour confirmation
+  lcd.clear();
+  lcd.print(F("Values set to:"));
+  lcd.setCursor(0, 1);
+  lcd.print(F("A:"));
+  lcd.print(MAINT_A, 5);
+  lcd.setCursor(0, 2);
+  lcd.print(F("B:"));
+  lcd.print(MAINT_B, 5);
+  lcd.setCursor(0, 3);
+  lcd.print(F("C:"));
+  lcd.print(MAINT_C, 1);
+  delay(2000);
 
   lcd.noBlink();
   menu_select = 0;
-}
-
-void ctdn(int dur, unsigned long &start)
-{
-  static bool wasPaused = false; // Indique si on était en pause précédemment
-
-  if (pauseCountdown)
-  {
-    if (!wasPaused)
-    {
-      pausedTime = (dur * 60) - ((millis() - start) / 1000); // Sauvegarde le temps restant
-      wasPaused = true;
-    }
-    return; // Bloque le décompte tant qu'on est en pause
-  }
-
-  if (wasPaused)
-  {
-    // Ajuste "start" pour reprendre là où on s'était arrêté
-    start = millis() - ((dur * 60) - pausedTime) * 1000;
-    wasPaused = false;
-  }
-
-  old_s = s;
-  old_m = m;
-  old_h = h;
-  timelapse = (dur * 60) - ((millis() - start) / 1000);
-  h = timelapse / 3600;
-  m = (timelapse - (h * 3600)) / 60;
-  s = timelapse - h * 3600 - m * 60;
-
-  if (old_h != h)
-  {
-    lcd.setCursor(0, 3);
-    if (h < 10)
-      lcd.print('0');
-    lcd.print(h);
-    lcd.print(F(":"));
-  }
-  if (old_m != m)
-  {
-    lcd.setCursor(3, 3);
-    if (m < 10)
-      lcd.print('0');
-    lcd.print(m);
-    lcd.print(F(":"));
-  }
-
-  if (old_s != s)
-  {
-    lcd.setCursor(6, 3);
-    if (s < 10)
-      lcd.print('0');
-    lcd.print(s);
-  }
-}
-
-void automatic()
-{
-  lcd.clear();
-  bool brek = 0;
-
-  actual_step = 0;
-  stepcomplete = 0;
-  temp_reached = 0;
-  chrono_started = 0;
-  step_time_started = 0;
-  pause = 0;
-  confirm = 0;
-  actual_hop = 0;
-  automode_started = 1;
-  setpoint_mgmt();
-  pwm = -1;
-  ssr_mgmt();
-
-  while (((actual_step < mash_rests - 1) && encbutton_state != 2) && brek == 0)
-  {
-
-    lcd.setCursor(0, 3);
-    lcd.print(F("00:00:00"));
-    lcd.setCursor(0, 1);
-    lcd.print(F("PWM: "));
-    lcd.setCursor(19, 3);
-    lcd.print(F("F"));
-    Setpoint = int(rest_stp[actual_step]);
-    if (actual_step < mash_rests - 1)
-    {
-      lcd.setCursor(0, 0);
-      print_space(12);
-      lcd.setCursor(0, 0);
-      lcd.print(F("Step #"));
-      lcd.print(actual_step + 1);
-      lcd.write(ARROW_RIGHT);
-      lcd.print(Setpoint, 0);
-      print_deg();
-    }
-    else
-    {
-      lcd.setCursor(0, 0);
-      print_space(12);
-      lcd.setCursor(0, 0);
-      lcd.print(F("Boil "));
-      lcd.write(ARROW_RIGHT);
-      lcd.print(Setpoint, 0);
-      print_deg();
-    }
-    while (!stepcomplete && brek != 1)
-    {
-      buttonstate();
-
-      read_temp();
-      if (encbutton_state == 4)
-      {
-        brek = 1;
-      }
-      if (encbutton_state == 1 && confirm)
-      {
-        // clear message & confirm action
-
-        lcd.setCursor(0, 2);
-        print_space(12);
-        confirm = 0;
-        encbutton_state = 0;
-        pauseCountdown = 0;
-        buzz.off();
-      }
-      if (encbutton_state == 1 && !pause && !confirm)
-      {
-        pause = !pause;
-        encbutton_state = 0;
-        pwm = 0;
-        ssr_mgmt();
-        lcd.setCursor(0, 2);
-        lcd.print(F("PWM Paused"));
-        lcd.setCursor(19, 3);
-        lcd.print(F("C"));
-      }
-
-      if (encbutton_state == 1 && pause && !confirm)
-      {
-        pause = !pause;
-        encbutton_state = 0;
-        lcd.setCursor(0, 2);
-        print_space(14);
-        lcd.setCursor(19, 3);
-        lcd.print(F("F"));
-      }
-
-      if (!pause)
-      {
-        setpoint_mgmt();
-        ssr_mgmt();
-      }
-
-      if (chrono_started)
-      {
-
-        if (encPos != 0 && pause)
-        {
-          // ajust time if in pause && timer started
-          rest_dur[actual_step] = constrain(rest_dur[actual_step] + encPos, 1, 120);
-          encPos = 0;
-        }
-        // display counter
-        ctdn(rest_dur[actual_step], step_time_started);
-
-        if (encPos != 0 && !pause && delta < PWM_NEAR && delta > OVERSHOOT_X)
-        {
-          // ajust pwm power
-          fine();
-          encPos = 0;
-        }
-      }
-      if (delta < NEAR_LIMIT && temp_reached == 0)
-      {
-        temp_reached = 1;
-        chrono_started = 1;
-        step_time_started = millis();
-        if (actual_step == 0)
-        {
-          lcd.setCursor(0, 2);
-          lcd.print(F("Add Malt"));
-          pauseCountdown = 1;
-          confirm = 1;
-          buzz.pattern(3, true);
-        }
-        if (actual_step == mash_rests - 1)
-        {
-          lcd.setCursor(0, 2);
-          lcd.print(F("Remove malt"));
-          pauseCountdown = 1;
-          confirm = 1;
-          buzz.on();
-          buzz.pattern(3, true);
-        }
-      }
-      if (temp_reached && (millis() - step_time_started) > (rest_dur[actual_step] * 60000))
-      {
-        stepcomplete = 1;
-        lcd.setCursor(0, 3);
-        print_space(9);
-        buzz.pattern(3, false);
-      }
-      if (actual_step == (mash_rests - 1))
-      {
-        // on test si on est bien en boil
-        if ((rest_dur[actual_step] - m) == hop_time[actual_hop] && s == 0 && actual_hop < hops_nmbr)
-        {
-          actual_hop++;
-          lcd.setCursor(0, 2);
-          lcd.print(F("Add hop #"));
-          lcd.print(actual_hop);
-          confirm = 1;
-          buzz.pattern(3, true);
-        }
-      }
-    }
-    encbutton_state = 0;
-    actual_step++;
-  }
-
-  automode_started = 0;
-  lcd.clear();
-  if (brek == 1)
-  {
-    pwm = 0;
-    ssr_mgmt();
-    lcd.clear();
-    lcd.print(F("Canceled !"));
-  }
-  else
-  {
-    lcd.print(F("Finished !"));
-    menu_select = 2;
-  }
-  delay(2000);
-}
-
-///////////////////// MENUS ////////////////////////////////////////
-
-void start_automation_menu()
-{
-  byte selected_index = menu_mode_flex(menu3, "---| AUTOMATION |---");
-
-  // Utilisez selected_index pour déterminer l'action à effectuer
-  switch (selected_index)
-  {
-  case 0:
-    // START AUTOMATION
-    lcd.clear();
-    lcd.print(F("Start..."));
-    delay(1000);
-    automatic();
-    start_automation_menu();
-    break;
-  case 1:
-    menu_select = 2;
-    break;
-  case 2:
-    menu_select = 0;
-    break;
-
-  default:
-    break;
-  }
-}
-
-void auto_mode()
-{
-  lcd.blink();
-  lcd.clear();
-  mash_rests = modify("How many steps ?", mash_rests, 2, 10, 1, "", 0);
-  String texte;
-  for (size_t i = 0; i < mash_rests; i++)
-  {
-    int ii;
-    texte = "Setpoint " + String(i + 1);
-    if (i > 0)
-    {
-      ii = i - 1;
-      rest_stp[i] = rest_stp[ii] + 1;
-    }
-    else
-    {
-      ii = 0;
-    }
-    rest_stp[i] = modify(texte, rest_stp[i], (rest_stp[ii] + 1), 99, 1, "\xDF"
-                                                                        "C",
-                         0);
-
-    texte = "Duration " + String(i + 1);
-    rest_dur[i] = modify(texte, rest_dur[i], 1, 120, 1, " min", 0);
-  }
-  mash_rests++;
-  rest_stp[mash_rests - 1] = 15;
-  rest_dur[mash_rests - 1] = 30;
-  rest_stp[mash_rests - 1] = modify("Boil temp :", rest_stp[mash_rests - 1], 15, 99, 0.5, "\xDF"
-                                                                                          "C",
-                                    1);
-  rest_dur[mash_rests - 1] = modify("Boil time :", rest_dur[mash_rests - 1], 30, 120, 5, " min", 0);
-
-  hops_nmbr = modify("How many hops adds ?", hops_nmbr, 1, 5, 1, "", 0);
-  for (size_t i = 0; i < hops_nmbr; i++)
-  {
-    texte = "Add Hop n" + String(char(223)) + String(i + 1) + " at";
-    lcd.setCursor(8, 1);
-    lcd.print(F("from boil"));
-    byte time_min = 1;
-    if (i != 0)
-    {
-      time_min = 1 + hop_time[i - 1];
-      hop_time[i] = 1 + hop_time[i - 1];
-    }
-    hop_time[i] = modify(texte, hop_time[i], time_min, rest_dur[mash_rests - 1], 1, " min", 0);
-  }
-
-  lcd.noBlink();
 }
 
 void memory_menu()
 {
   byte selected_index = menu_mode_flex(menu2, "---|MEMORY  MENU|---");
 
-  // Utilisez selected_index pour déterminer l'action à effectuer
   switch (selected_index)
   {
   case 0:
@@ -1315,7 +1074,6 @@ void main_menu()
 {
   byte selected_index = menu_mode_flex(menu1, "---| FUZZY BREW |---");
 
-  // Utilisez selected_index pour déterminer l'action à effectuer
   switch (selected_index)
   {
   case 0:
@@ -1328,12 +1086,8 @@ void main_menu()
     break;
   case 2:
     menu_select = 3;
-    break;
-  case 3:
-    menu_select = 4;
     memory_menu();
     break;
-
   default:
     break;
   }
@@ -1351,10 +1105,6 @@ void loop()
     manual_mode();
     break;
   case 2:
-    auto_mode();
-    start_automation_menu();
-    break;
-  case 3:
     set_m();
     break;
   default:
@@ -1397,4 +1147,14 @@ void buttonstate()
   }
 
   click_prev = state;
+}
+void red()
+{
+  strip.setPixelColor(0, strip.Color(25, 0, 0)); // Rouge
+  strip.show();
+}
+void black()
+{
+  strip.setPixelColor(0, strip.Color(0, 0, 0)); // noir
+  strip.show();
 }
